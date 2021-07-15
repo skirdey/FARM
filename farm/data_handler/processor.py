@@ -236,14 +236,15 @@ class Processor(ABC):
 
     @classmethod
     def convert_from_transformers(cls, tokenizer_name_or_path, task_type, max_seq_len, doc_stride,
-                                  revision=None, tokenizer_class=None, tokenizer_args=None, use_fast=True):
-        config = AutoConfig.from_pretrained(tokenizer_name_or_path, revision=revision)
+                                  revision=None, tokenizer_class=None, tokenizer_args=None, use_fast=True, **kwargs):
+        config = AutoConfig.from_pretrained(tokenizer_name_or_path, revision=revision, **kwargs)
         tokenizer_args = tokenizer_args or {}
         tokenizer = Tokenizer.load(tokenizer_name_or_path,
                                    tokenizer_class=tokenizer_class,
                                    use_fast=use_fast,
                                    revision=revision,
                                    **tokenizer_args,
+                                   **kwargs
                                    )
 
         # TODO infer task_type automatically from config (if possible)
@@ -375,7 +376,7 @@ class Processor(ABC):
     def log_problematic(problematic_sample_ids):
         if problematic_sample_ids:
             n_problematic = len(problematic_sample_ids)
-            problematic_id_str = ", ".join(problematic_sample_ids)
+            problematic_id_str = ", ".join([str(i) for i in problematic_sample_ids])
             logger.error(
                 f"Unable to convert {n_problematic} samples to features. Their ids are : {problematic_id_str}")
 
@@ -506,6 +507,7 @@ class TextClassificationProcessor(Processor):
         dev_filename=None,
         test_filename="test.tsv",
         dev_split=0.1,
+        dev_stratification=False,
         delimiter="\t",
         quote_char="'",
         skiprows=None,
@@ -542,6 +544,8 @@ class TextClassificationProcessor(Processor):
         :type test_filename: str
         :param dev_split: The proportion of the train set that will sliced. Only works if dev_filename is set to None
         :type dev_split: float
+        :param dev_stratification: if True, create a class-stratified split for the dev set.
+        :type dev_stratification: bool
         :param delimiter: Separator used in the input tsv / csv file
         :type delimiter: str
         :param quote_char: Character used for quoting strings in the input tsv/ csv file
@@ -570,6 +574,8 @@ class TextClassificationProcessor(Processor):
         self.skiprows = skiprows
         self.header = header
         self.max_samples = max_samples
+        self.dev_stratification = dev_stratification
+        logger.warning(f"Currently no support in Processor for returning problematic ids")
 
         super(TextClassificationProcessor, self).__init__(
             tokenizer=tokenizer,
@@ -672,7 +678,6 @@ class TextClassificationProcessor(Processor):
 
         # TODO populate problematic ids
         problematic_ids = set()
-        logger.warning("Currently no support in Processor for returning problematic ids")
         dataset, tensornames = self._create_dataset()
         if return_baskets:
             return dataset, tensornames, problematic_ids, self.baskets
@@ -794,7 +799,8 @@ class RegressionProcessor(TextClassificationProcessor):
         :type dev_filename: str or None
         :param test_filename: None
         :type test_filename: str
-        :param dev_split: The proportion of the train set that will sliced. Only works if dev_filename is set to None
+        :param dev_split: The proportion of the train set that will sliced. No devset is created if this is set to 0.0
+            Only used if dev_filename is set to None
         :type dev_split: float
         :param delimiter: Separator used in the input tsv / csv file
         :type delimiter: str
@@ -1007,7 +1013,6 @@ class InferenceProcessor(TextClassificationProcessor):
                 self._log_samples(1)
 
             problematic_ids = set()
-            logger.warning("Currently no support in InferenceProcessor for returning problematic ids")
             dataset, tensornames = self._create_dataset()
             ret = [dataset, tensornames, problematic_ids]
             if return_baskets:
@@ -1707,10 +1712,18 @@ class BertStyleLMProcessor(Processor):
         :type max_predictions_per_seq: int
         :return: (list of int, list of int), masked tokens and related labels for LM prediction
         """
+        
         # 1. Combine tokens to one group (e.g. all subtokens of a word)
+
+        # tokens can have different ids depending on the model
+        pad_token_id = self.tokenizer.vocab["[PAD]"]
+        cls_token_id = self.tokenizer.vocab["[SEP]"]
+        sep_token_id = self.tokenizer.vocab["[CLS]"]
+        mask_token_id = self.tokenizer.vocab["[MASK]"]
+
         cand_indices = []
         for (i, token) in enumerate(tokens):
-            if token == 101 or token == 102 or token == 0:
+            if token == cls_token_id or token == sep_token_id or token == pad_token_id: # CLS, SEP and PAD tokens
                 continue
             if (token_groups and len(cand_indices) >= 1 and not token_groups[i]):
                 cand_indices[-1].append(i)
@@ -1724,7 +1737,7 @@ class BertStyleLMProcessor(Processor):
 
         output_label = [-1] * len(tokens)
         num_masked = 0
-        assert 103 not in tokens #mask token
+        assert mask_token_id not in tokens #mask token
 
         # 2. Mask the first groups until we reach the number of tokens we wanted to mask (num_to_mask)
         for index_set in cand_indices:
@@ -1741,7 +1754,7 @@ class BertStyleLMProcessor(Processor):
                 original_token = tokens[index]
                 # 80% randomly change token to mask token
                 if prob < 0.8:
-                    tokens[index] = 103
+                    tokens[index] = mask_token_id
 
                 # 10% randomly change token to random token
                 # TODO currently custom vocab is not included here
@@ -1861,10 +1874,10 @@ class SquadProcessor(Processor):
         self.ph_output_type = "per_token_squad"
 
         assert doc_stride < (max_seq_len - max_query_length), \
-            "doc_stride is longer than max_seq_len minus space reserved for query tokens. \nThis means that there will be gaps " \
+            "doc_stride ({}) is longer than max_seq_len ({}) minus space reserved for query tokens ({}). \nThis means that there will be gaps " \
             "as the passage windows slide, causing the model to skip over parts of the document.\n" \
             "Please set a lower value for doc_stride (Suggestions: doc_stride=128, max_seq_len=384)\n " \
-            "Or decrease max_query_length"
+            "Or decrease max_query_length".format(doc_stride, max_seq_len, max_query_length)
 
         self.doc_stride = doc_stride
         self.max_query_length = max_query_length
@@ -1941,10 +1954,10 @@ class SquadProcessor(Processor):
         """
         # check again for doc stride vs max_seq_len when. Parameters can be changed for already initialized models (e.g. in haystack)
         assert self.doc_stride < (self.max_seq_len - self.max_query_length), \
-            "doc_stride is longer than max_seq_len minus space reserved for query tokens. \nThis means that there will be gaps " \
+            "doc_stride ({}) is longer than max_seq_len ({}) minus space reserved for query tokens ({}). \nThis means that there will be gaps " \
             "as the passage windows slide, causing the model to skip over parts of the document.\n" \
             "Please set a lower value for doc_stride (Suggestions: doc_stride=128, max_seq_len=384)\n " \
-            "Or decrease max_query_length"
+            "Or decrease max_query_length".format(self.doc_stride, self.max_seq_len, self.max_query_length)
 
         try:
             # Check if infer_dict is already in internal json format
